@@ -30,7 +30,7 @@ class MyApp extends StatelessWidget {
         // tested with just a hot reload.
         colorScheme: .fromSeed(seedColor: Colors.deepPurple),
       ),
-      home: const MyHomePage(title: 'Env: ${const String.fromEnvironment('APP_ENV', defaultValue: 'NOT_SET')}'),
+      home: const MyHomePage(title: 'Env: ${String.fromEnvironment('APP_ENV', defaultValue: 'NOT_SET')}'),
     );
   }
 }
