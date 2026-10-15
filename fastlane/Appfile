@@ -1,0 +1,25 @@
+# For more information about the Appfile, see:
+#     https://docs.fastlane.tools/advanced/#appfile
+
+for_platform :ios do
+  # iOS Bundle Identifier
+  app_identifier(ENV["IOS_APP_IDENTIFIER"] || ENV["APP_IDENTIFIER"] || "com.tahakom.producer")
+
+  # Apple Developer Portal username (email)
+  apple_id(ENV["APPLE_ID"]) if ENV["APPLE_ID"] && !ENV["APPLE_ID"].strip.empty?
+
+  # Apple Developer Team ID (10 alphanumeric characters)
+  team_id(ENV["APPLE_TEAM_ID"] || ENV["TEAM_ID"]) if (ENV["APPLE_TEAM_ID"] || ENV["TEAM_ID"]) && !(ENV["APPLE_TEAM_ID"] || ENV["TEAM_ID"]).strip.empty?
+
+  # App Store Connect Team ID (numerical ID)
+  itc_team_id(ENV["ITC_TEAM_ID"]) if ENV["ITC_TEAM_ID"] && !ENV["ITC_TEAM_ID"].strip.empty?
+end
+
+for_platform :android do
+  # Android Package Name
+  package_name(ENV["ANDROID_PACKAGE_NAME"] || ENV["APP_IDENTIFIER"] || "com.tahakom.producer")
+
+  # Path to Google Play Service Account JSON key
+  json_key_file(ENV["ANDROID_JSON_KEY_FILE"]) if ENV["ANDROID_JSON_KEY_FILE"] && !ENV["ANDROID_JSON_KEY_FILE"].strip.empty?
+end
+

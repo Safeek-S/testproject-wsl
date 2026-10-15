@@ -1,0 +1,75 @@
+require_relative 'builders/flutter'
+require_relative 'configs/base'
+require_relative 'lib/context'
+require_relative 'lib/git'
+require_relative 'lib/input'
+require_relative 'lib/notification'
+require_relative 'lib/teams'
+require_relative 'builders/firebase'
+
+before_all do |lane|
+	pwd = nil
+	Dir.chdir('../') do
+		pwd = Dir.pwd
+	end
+
+	Context.save_project_root(pwd)
+end
+
+desc 'Run build_runner and easy_localization code generation commands'
+lane :code_gen do |options|
+	app = UserInput.get_app(options)
+	FlutterBuilder.code_generation(app)
+end
+
+desc 'Run easy_localization code generation commands'
+lane :lang_gen do |options|
+	UserInput.get_app(options)
+	FlutterBuilder.language_gen
+end
+
+desc 'Build releases with Flutter (supports mode: fast|full|clean)'
+lane :build do |options|
+	app = UserInput.get_app(options)
+	FlutterBuilder.build(options.merge(app: app))
+end
+
+desc 'Clean install flutter dependencies & run pod updates'
+lane :clean_deps do |options|
+  app = UserInput.get_app(options)
+  FlutterBuilder.clean_deps(app)
+end
+
+desc 'Tag release with version and changes from CHANGE_LOGS.md'
+lane :tag_release do |options|
+	app = UserInput.get_app(options)
+	Git.tag_release(app)
+end
+
+desc 'Build and distribute to Firebase App Distribution (supports mode: fast|full|clean, skip_teams: true, skip_bump: true)'
+lane :distribute do |options|
+  app = UserInput.get_app(options)
+  platform = UserInput.get_platform(options)
+  env = UserInput.get_env(options)
+
+  # If platform is android and app is private, then set artifcats to split_apk
+  # else if app is public, then set artifcats to aab
+  if platform == "android" || platform == "both"
+    if app == "private"
+      options[:artifacts] = "split_apk"
+    elsif app == "public"
+      options[:artifacts] = "fat_apk"
+    end
+  end
+
+  # 1. Set environment and auto-increment build number from Firebase App Distribution
+  Context.set_env(options)
+  Context.bump_build_number_from_firebase(options)
+
+  # 2. Build the app (suppressing intermediate notification)
+  # Note: build lane already sets up env, version, iteration etc.
+  build(options.merge(notify: false))
+
+  # 3. Distribute to Firebase (plays notification on completion)
+  FirebaseBuilder.distribute(options)
+end

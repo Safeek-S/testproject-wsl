@@ -1,0 +1,352 @@
+# Fastlane configuration for Flutter project
+# Root Fastfile: Multiplatform (iOS & Android) with App Store Connect API Key & env.json
+
+require 'pathname'
+require 'fileutils'
+require 'open3'
+
+default_platform(:ios)
+
+# Helper to get Flutter project root directory
+def project_root
+  File.expand_path("..", __dir__)
+end
+
+# Helper to resolve the .p8 private key file path
+def resolve_p8_key_path
+  raw_path = ENV["APP_STORE_CONNECT_KEY_FILEPATH"] || "fastlane/some_key.p8"
+
+  candidates = [
+    File.expand_path(raw_path, project_root),
+    File.expand_path(raw_path, __dir__),
+    File.expand_path(File.basename(raw_path), __dir__),
+    File.expand_path("some_key.p8", __dir__),
+    File.expand_path("fastlane/some_key.p8", project_root)
+  ].uniq
+
+  found = candidates.find { |p| File.exist?(p) }
+  return found if found
+
+  File.expand_path("some_key.p8", __dir__)
+end
+
+# Helper to resolve dart-define env.json file path
+def resolve_env_json_flag
+  env_file_name = ENV["ENV_JSON_PATH"] || "env.json"
+
+  candidates = [
+    File.expand_path(env_file_name, project_root),
+    File.expand_path("env.json", project_root)
+  ].uniq
+
+  found = candidates.find { |p| File.exist?(p) }
+  if found
+    relative_path = Pathname.new(found).relative_path_from(Pathname.new(project_root)).to_s
+    UI.message("Using environment config for --dart-define-from-file: #{relative_path}")
+    "--dart-define-from-file=#{relative_path}"
+  else
+    UI.important("Notice: #{env_file_name} not found at project root. Skipping --dart-define-from-file flag.")
+    nil
+  end
+end
+
+# Helper to resolve the IPA file path for TestFlight / App Store
+def resolve_ipa_path(custom_path = nil)
+  candidates = [
+    (File.expand_path(custom_path, project_root) if custom_path),
+    (File.expand_path(ENV["IPA_PATH"], project_root) if ENV["IPA_PATH"] && !ENV["IPA_PATH"].strip.empty?),
+    File.expand_path("build/ios-linux/Runner.ipa", project_root),
+    File.expand_path("build/ios-linux/runner.ipa", project_root),
+    File.expand_path("ios-linux/runner.ipa", project_root),
+    File.expand_path("ios-linux/Runner.ipa", project_root),
+    File.expand_path("build/ios/ipa/runner.ipa", project_root),
+    File.expand_path("build/ios/ipa/Runner.ipa", project_root)
+  ].compact.uniq
+
+  found = candidates.find { |p| File.exist?(p) }
+  return found if found
+
+  File.expand_path(ENV["IPA_PATH"] || "build/ios-linux/Runner.ipa", project_root)
+end
+
+def validate_ipa_for_testflight!(ipa_file)
+  unless ipa_file.downcase.end_with?(".ipa")
+    UI.user_error!("Invalid upload file: #{ipa_file}. Expected a .ipa file for TestFlight upload.")
+  end
+
+  listing, status = Open3.capture2e("unzip", "-Z1", ipa_file)
+  unless status.success?
+    UI.user_error!("Unable to inspect IPA at #{ipa_file}. Ensure 'unzip' is installed and the IPA is valid.\nDetails: #{listing.strip}")
+  end
+
+  files = listing.lines.map(&:strip)
+  info_plist = files.find { |entry| entry.match?(%r{\APayload/[^/]+\.app/Info\.plist\z}) }
+
+  unless info_plist
+    UI.user_error!("Invalid IPA structure: missing Payload/<App>.app/Info.plist in #{ipa_file}. Build/export the IPA with Xcode (App Store export) before uploading.")
+  end
+
+  UI.message("IPA validation passed (found #{info_plist}).")
+end
+
+def resolve_app_store_info_plist_path(ipa_file, custom_path = nil)
+  candidates = [
+    (File.expand_path(custom_path, project_root) if custom_path && !custom_path.to_s.strip.empty?),
+    (File.expand_path(ENV["APP_STORE_INFO_PLIST_PATH"], project_root) if ENV["APP_STORE_INFO_PLIST_PATH"] && !ENV["APP_STORE_INFO_PLIST_PATH"].strip.empty?),
+    File.join(File.dirname(ipa_file), "AppStoreInfo.plist"),
+    File.expand_path("build/ios-linux/AppStoreInfo.plist", project_root),
+    File.expand_path("ios-linux/AppStoreInfo.plist", project_root)
+  ].compact.uniq
+
+  candidates.find { |p| File.exist?(p) }
+end
+
+def ensure_app_store_info_plist_for_upload!(ipa_file, custom_path = nil)
+  plist_path = resolve_app_store_info_plist_path(ipa_file, custom_path)
+  ipa_dir_plist = File.join(File.dirname(ipa_file), "AppStoreInfo.plist")
+
+  unless plist_path
+    UI.user_error!("Missing AppStoreInfo.plist required for Linux/WSL TestFlight uploads.\nExpected next to IPA: #{ipa_dir_plist}\nBuild/export on macOS with 'generateAppStoreInformation: true', then upload both Runner.ipa and AppStoreInfo.plist together.")
+  end
+
+  if plist_path != ipa_dir_plist
+    FileUtils.cp(plist_path, ipa_dir_plist)
+    UI.message("Copied AppStoreInfo.plist to IPA directory: #{ipa_dir_plist}")
+    plist_path = ipa_dir_plist
+  end
+
+  plist_content = File.read(plist_path)
+  unless plist_content.include?("<plist")
+    UI.user_error!("Invalid AppStoreInfo.plist at #{plist_path}. The file does not look like a valid plist.")
+  end
+end
+
+# Helper to authenticate with App Store Connect API Key
+def setup_app_store_connect
+  key_id = ENV["APP_STORE_CONNECT_KEY_ID"]
+  issuer_id = ENV["APP_STORE_CONNECT_ISSUER_ID"]
+
+  if key_id && !key_id.strip.empty? && issuer_id && !issuer_id.strip.empty?
+    p8_path = resolve_p8_key_path
+    UI.message("Configuring App Store Connect API Key (Key ID: #{key_id.strip})...")
+
+    if File.exist?(p8_path)
+      UI.message("Found .p8 private key at: #{p8_path}")
+      app_store_connect_api_key(
+        key_id: key_id.strip,
+        issuer_id: issuer_id.strip,
+        key_filepath: p8_path,
+        in_house: false
+      )
+    else
+      UI.user_error!("App Store Connect key file not found at: #{p8_path}\nPlease place your .p8 key file inside the fastlane/ folder (e.g. fastlane/some_key.p8).")
+    end
+  end
+end
+
+# ------------------------------------------------------------------------------
+# iOS PLATFORM
+# ------------------------------------------------------------------------------
+platform :ios do
+  before_all do
+    # Configure Transporter on Linux/WSL environments
+    if !FastlaneCore::Helper.mac? && !FastlaneCore::Helper.windows?
+      ENV["FASTLANE_ITUNES_TRANSPORTER_PATH"] ||= "/usr/local/itms"
+      ENV["FASTLANE_ITUNES_TRANSPORTER_USE_SHELL_SCRIPT"] ||= "true"
+    end
+
+    setup_app_store_connect
+  end
+
+  desc "Build Flutter iOS project with --dart-define-from-file=env.json"
+  private_lane :flutter_build_ios do |options|
+    UI.message("Building Flutter iOS project...")
+
+    build_args = ["build", "ios", "--release", "--no-codesign"]
+
+    env_flag = resolve_env_json_flag
+    build_args << env_flag if env_flag
+
+    build_number = options[:build_number] || ENV["BUILD_NUMBER"]
+    build_name = options[:build_name] || ENV["BUILD_NAME"]
+
+    build_args << "--build-number=#{build_number}" if build_number && !build_number.to_s.strip.empty?
+    build_args << "--build-name=#{build_name}" if build_name && !build_name.to_s.strip.empty?
+
+    Dir.chdir(project_root) do
+      sh("flutter", *build_args)
+    end
+  end
+
+desc "Build signed iOS IPA"
+  lane :build do |options|
+    flutter_build_ios(options)
+
+    workspace_path = File.join(project_root, "ios", "Runner.xcworkspace")
+
+    build_app(
+      workspace: workspace_path,
+      scheme: "Runner",
+      export_method: ENV["EXPORT_METHOD"] || "app-store",
+      clean: true,
+      output_directory: File.join(project_root, "build", "ios-linux"),
+      output_name: "Runner.ipa",
+      export_options: {
+        generateAppStoreInformation: true
+      }
+    )
+  end
+
+  desc "Release IPA (from ios-linux/runner.ipa) to TestFlight"
+  lane :beta do |options|
+    UI.message("Preparing TestFlight deployment...")
+
+    # Optional build if explicitly requested: fastlane ios beta build:true
+    if options[:build] == true || options[:build] == "true"
+      build(options)
+    end
+
+    ipa_file = resolve_ipa_path(options[:ipa])
+
+    unless File.exist?(ipa_file)
+      UI.user_error!("❌ IPA file not found at: #{ipa_file}\nPlease place your compiled IPA at 'ios-linux/runner.ipa' or pass ipa:'path/to/app.ipa'")
+    end
+
+    validate_ipa_for_testflight!(ipa_file)
+    ensure_app_store_info_plist_for_upload!(ipa_file, options[:app_store_info_plist])
+
+    UI.message("Uploading IPA to TestFlight: #{ipa_file}")
+
+    app_id = ENV["APP_IDENTIFIER"] || "com.tahakom.producer"
+    changelog = options[:changelog] || ENV["TESTFLIGHT_CHANGELOG"] || "New build via Fastlane"
+
+    wait_processing = ENV["WAIT_FOR_PROCESSING"] == "true"
+
+    upload_to_testflight(
+      app_identifier: app_id,
+      app_platform: "ios",
+      ipa: ipa_file,
+      skip_waiting_for_build_processing: !wait_processing,
+      changelog: changelog
+    )
+
+    UI.success("Successfully released #{File.basename(ipa_file)} to TestFlight!")
+  end
+
+
+
+  desc "Release IPA (from ios-linux/runner.ipa) to App Store"
+  lane :release do |options|
+    UI.message("Preparing App Store release...")
+
+    if options[:build] == true || options[:build] == "true"
+      build(options)
+    end
+
+    ipa_file = resolve_ipa_path(options[:ipa])
+
+    unless File.exist?(ipa_file)
+      UI.user_error!("❌ IPA file not found at: #{ipa_file}\nPlease place your compiled IPA at 'ios-linux/runner.ipa'")
+    end
+
+    app_id = ENV["APP_IDENTIFIER"] || "com.tahakom.producer"
+    ensure_app_store_info_plist_for_upload!(ipa_file, options[:app_store_info_plist])
+
+    upload_to_app_store(
+      app_identifier: app_id,
+      ipa: ipa_file,
+      force: true,
+      skip_screenshots: true,
+      skip_metadata: ENV["SKIP_METADATA"] != "false"
+    )
+
+    UI.success("Successfully uploaded #{File.basename(ipa_file)} to the App Store!")
+  end
+
+  error do |lane, exception|
+    UI.error("Fastlane error in iOS lane '#{lane}': #{exception.message}")
+  end
+end
+
+# ------------------------------------------------------------------------------
+# ANDROID PLATFORM
+# ------------------------------------------------------------------------------
+platform :android do
+  desc "Build Flutter Android App Bundle (AAB) with --dart-define-from-file=env.json"
+  lane :build do |options|
+    UI.message("Building Flutter Android App Bundle...")
+
+    build_args = ["build", "appbundle", "--release"]
+
+    env_flag = resolve_env_json_flag
+    build_args << env_flag if env_flag
+
+    build_number = options[:build_number] || ENV["BUILD_NUMBER"]
+    build_name = options[:build_name] || ENV["BUILD_NAME"]
+
+    build_args << "--build-number=#{build_number}" if build_number && !build_number.to_s.strip.empty?
+    build_args << "--build-name=#{build_name}" if build_name && !build_name.to_s.strip.empty?
+
+    Dir.chdir(project_root) do
+      sh("flutter", *build_args)
+    end
+  end
+
+  desc "Build Flutter Android APK with --dart-define-from-file=env.json"
+  lane :build_apk do |options|
+    UI.message("Building Flutter Android APK...")
+
+    build_args = ["build", "apk", "--release"]
+
+    env_flag = resolve_env_json_flag
+    build_args << env_flag if env_flag
+
+    build_number = options[:build_number] || ENV["BUILD_NUMBER"]
+    build_name = options[:build_name] || ENV["BUILD_NAME"]
+
+    build_args << "--build-number=#{build_number}" if build_number && !build_number.to_s.strip.empty?
+    build_args << "--build-name=#{build_name}" if build_name && !build_name.to_s.strip.empty?
+
+    Dir.chdir(project_root) do
+      sh("flutter", *build_args)
+    end
+  end
+
+  desc "Build and upload AAB to Google Play Internal Testing"
+  lane :beta do |options|
+    build(options)
+
+    aab_path = File.join(project_root, "build", "app", "outputs", "bundle", "release", "app-release.aab")
+
+    upload_to_play_store(
+      track: "internal",
+      aab: aab_path,
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true
+    )
+
+    UI.success("Successfully uploaded AAB to Google Play Internal Testing!")
+  end
+
+  desc "Build and upload AAB to Google Play Production"
+  lane :release do |options|
+    build(options)
+
+    aab_path = File.join(project_root, "build", "app", "outputs", "bundle", "release", "app-release.aab")
+
+    upload_to_play_store(
+      track: "production",
+      aab: aab_path,
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true
+    )
+
+    UI.success("Successfully uploaded AAB to Google Play Production!")
+  end
+
+  error do |lane, exception|
+    UI.error("Fastlane error in Android lane '#{lane}': #{exception.message}")
+  end
+end
